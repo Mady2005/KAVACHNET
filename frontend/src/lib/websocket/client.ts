@@ -1,0 +1,1 @@
+export function eventSocket(url:string,onMessage:(data:unknown)=>void){const ws=new WebSocket(url);ws.onmessage=e=>{try{onMessage(JSON.parse(e.data))}catch{ /* ignore malformed frames */ }};return ws}
