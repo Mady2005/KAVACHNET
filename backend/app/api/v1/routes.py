@@ -13,7 +13,7 @@ from app.core.config import settings
 from app.db.session import get_db, engine
 from app.models import User, AuditLog, KavachEventRecord, DecisionRecord, DatasetRegistry, RevokedToken, Role
 from app.schemas.events import KavachEvent
-from app.schemas.api import UserOut, DatasetIn, DatasetOut, LoginIn, LoginOut, RegisterIn
+from app.schemas.api import UserOut, DatasetIn, DatasetOut, DatasetPatch, LoginIn, LoginOut, RegisterIn, RoleUpdateIn
 
 router=APIRouter(); bearer=HTTPBearer(auto_error=False)
 _login_failures=defaultdict(deque); _login_lock=Lock(); _LOGIN_WINDOW_SECONDS=900; _LOGIN_MAX_FAILURES=5
@@ -102,6 +102,13 @@ def event_detail(event_id:str,user:User=Depends(current_user),db:Session=Depends
     return event_dict(e)
 @router.post("/events",status_code=201)
 def create_event(event:KavachEvent,user:User=Depends(roles(Role.ADMIN,Role.SECURITY_ANALYST,Role.EDGE_OPERATOR,Role.NETWORK_OPERATOR)),db:Session=Depends(get_db)):
+    permitted_sources={
+        Role.SECURITY_ANALYST: {"SECURITY"},
+        Role.EDGE_OPERATOR: {"EDGE_AI"},
+        Role.NETWORK_OPERATOR: {"NETWORK"},
+    }
+    if user.role != Role.ADMIN and event.source_module.value not in permitted_sources.get(user.role, set()):
+        raise HTTPException(403,"Role may only submit events for its assigned module")
     values=event.model_dump()
     values.update(event_id=str(event.event_id),timestamp=event.timestamp)
     values={k:(v.value if hasattr(v,"value") else v) for k,v in values.items()}
@@ -115,11 +122,13 @@ def audit_logs(user:User=Depends(roles(Role.ADMIN)),db:Session=Depends(get_db)):
 @router.get("/users",response_model=list[UserOut])
 def users(user:User=Depends(roles(Role.ADMIN)),db:Session=Depends(get_db)): return db.scalars(select(User).order_by(User.username)).all()
 @router.patch("/users/{user_id}/role",response_model=UserOut)
-def update_role(user_id:str,body:dict,user:User=Depends(roles(Role.ADMIN)),db:Session=Depends(get_db)):
+def update_role(user_id:str,body:RoleUpdateIn,user:User=Depends(roles(Role.ADMIN)),db:Session=Depends(get_db)):
     target=db.get(User,user_id)
     if not target: raise HTTPException(404,"User not found")
-    try: role=Role(body["role"])
-    except (KeyError,ValueError): raise HTTPException(422,"Unknown role")
+    role=body.role
+    if target.is_active and target.role == Role.ADMIN and role != Role.ADMIN:
+        active_admins=db.scalar(select(func.count()).select_from(User).where(User.role==Role.ADMIN,User.is_active.is_(True))) or 0
+        if active_admins <= 1: raise HTTPException(409,"Cannot demote the last active administrator")
     old=target.role.value; target.role=role; db.commit(); audit(db,user.id,"user.role.update","user","success",{"from":old,"to":role.value},user_id); return target
 @router.get("/datasets",response_model=list[DatasetOut])
 def datasets(user:User=Depends(current_user),db:Session=Depends(get_db)): return db.scalars(select(DatasetRegistry).order_by(DatasetRegistry.created_at.desc())).all()
@@ -127,9 +136,12 @@ def datasets(user:User=Depends(current_user),db:Session=Depends(get_db)): return
 def add_dataset(data:DatasetIn,user:User=Depends(roles(Role.ADMIN)),db:Session=Depends(get_db)):
     row=DatasetRegistry(**data.model_dump()); db.add(row); db.commit(); db.refresh(row); audit(db,user.id,"dataset.create","dataset","success",rid=row.dataset_id); return row
 @router.patch("/datasets/{dataset_id}",response_model=DatasetOut)
-def edit_dataset(dataset_id:str,data:dict,user:User=Depends(roles(Role.ADMIN)),db:Session=Depends(get_db)):
+def edit_dataset(dataset_id:str,data:DatasetPatch,user:User=Depends(roles(Role.ADMIN)),db:Session=Depends(get_db)):
     row=db.get(DatasetRegistry,dataset_id)
     if not row: raise HTTPException(404,"Dataset not found")
-    for k in ("name","owning_member","source_url","license","description","provenance","schema_metadata","import_status","checksum"):
-        if k in data:setattr(row,k,data[k])
+    values=data.model_dump(exclude_unset=True)
+    nullable_fields={"source_url","license","checksum"}
+    for key,value in values.items():
+        if value is None and key not in nullable_fields: raise HTTPException(422,f"{key} cannot be null")
+        setattr(row,key,value)
     db.commit();db.refresh(row);audit(db,user.id,"dataset.update","dataset","success",rid=dataset_id);return row

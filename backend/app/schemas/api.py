@@ -11,3 +11,17 @@ class DatasetIn(BaseModel): name:str; owning_member:str; source_url:str|None=Non
 class DatasetOut(DatasetIn):
     model_config=ConfigDict(from_attributes=True)
     dataset_id:str; import_status:str; created_at:datetime
+class DatasetPatch(BaseModel):
+    model_config=ConfigDict(extra="forbid")
+    name:str|None=None
+    owning_member:str|None=None
+    source_url:str|None=None
+    license:str|None=None
+    description:str|None=None
+    provenance:dict|None=None
+    schema_metadata:dict|None=None
+    import_status:str|None=None
+    checksum:str|None=None
+class RoleUpdateIn(BaseModel):
+    model_config=ConfigDict(extra="forbid")
+    role:Role

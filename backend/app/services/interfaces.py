@@ -1,6 +1,6 @@
 """Extension contracts for module owners; implementations belong in module-specific services."""
 from typing import Protocol
-from app.schemas.events import KavachEvent
+from app.schemas.events import DecisionResult, KavachEvent
 class SecurityDetectionService(Protocol):
     def inspect(self, payload:dict)->KavachEvent: ...
 class SensorAnomalyService(Protocol):
@@ -8,7 +8,7 @@ class SensorAnomalyService(Protocol):
 class NetworkMonitoringService(Protocol):
     def snapshot(self)->dict: ...
 class DecisionEngine(Protocol):
-    def decide(self, event:KavachEvent)->dict: ...
+    def decide(self, event:KavachEvent)->DecisionResult: ...
 class EventPublisher(Protocol):
     async def publish(self, event:KavachEvent)->None: ...
 class WebSocketService(Protocol):
