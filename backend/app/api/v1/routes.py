@@ -4,38 +4,23 @@ import secrets
 from threading import Lock
 from time import monotonic
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 import jwt
 from app.auth.security import issue_token, hash_password, verify_password
+from app.auth.dependencies import bearer, current_user, roles
 from app.core.config import settings
 from app.db.session import get_db, engine
 from app.models import User, AuditLog, KavachEventRecord, DecisionRecord, DatasetRegistry, RevokedToken, Role
 from app.schemas.events import KavachEvent
 from app.schemas.api import UserOut, DatasetIn, DatasetOut, DatasetPatch, LoginIn, LoginOut, RegisterIn, RoleUpdateIn
+from app.services.event_store import add_event
 
-router=APIRouter(); bearer=HTTPBearer(auto_error=False)
+router=APIRouter()
 _login_failures=defaultdict(deque); _login_lock=Lock(); _LOGIN_WINDOW_SECONDS=900; _LOGIN_MAX_FAILURES=5
 def audit(db, actor, action, resource, outcome, details=None, rid=None):
     db.add(AuditLog(actor_user_id=actor,action=action,resource_type=resource,resource_id=rid,outcome=outcome,details=details or {})); db.commit()
-def current_user(request:Request, creds:HTTPAuthorizationCredentials|None=Depends(bearer), db:Session=Depends(get_db)):
-    token=creds.credentials if creds else request.cookies.get("kavach_session")
-    if not token: raise HTTPException(401,"Authentication required")
-    if not creds and request.method not in {"GET","HEAD","OPTIONS"}:
-        csrf_cookie=request.cookies.get("kavach_csrf",""); csrf_header=request.headers.get("X-CSRF-Token","")
-        if not csrf_cookie or not secrets.compare_digest(csrf_cookie,csrf_header): raise HTTPException(403,"CSRF validation failed")
-    try: payload=jwt.decode(token,settings.secret_key,algorithms=["HS256"])
-    except jwt.PyJWTError: raise HTTPException(401,"Invalid or expired credentials")
-    if db.get(RevokedToken,payload.get("jti")): raise HTTPException(401,"Session revoked")
-    user=db.get(User,payload.get("sub"))
-    if not user or not user.is_active: raise HTTPException(401,"Invalid or expired credentials")
-    return user
-def roles(*allowed):
-    def check(user:User=Depends(current_user)):
-        if user.role not in allowed: raise HTTPException(403,"Insufficient permissions")
-        return user
-    return check
 @router.post("/auth/login",response_model=LoginOut)
 def login(body:LoginIn, response:Response, db:Session=Depends(get_db)):
     identity=body.identity.strip(); password=body.password
@@ -77,7 +62,9 @@ def ready(db:Session=Depends(get_db)):
     except Exception: raise HTTPException(503,"Database unavailable")
 @router.get("/system/status")
 def system_status(user:User=Depends(current_user),db:Session=Depends(get_db)):
-    db.execute(select(1)); return {"status":"operational","api":"ok","database":"ok","modules":{"security":"not_configured","edge_ai":"not_configured","network":"not_configured"}}
+    from app.modules.network_resilience.simulator import latest_telemetry
+    db.execute(select(1)); network=latest_telemetry(db)
+    return {"status":"operational","api":"ok","database":"ok","modules":{"security":"not_configured","edge_ai":"not_configured","network":network.state if network else "not_initialized"}}
 @router.get("/dashboard/summary")
 def summary(user:User=Depends(current_user),db:Session=Depends(get_db)):
     count=db.scalar(select(func.count()).select_from(KavachEventRecord)) or 0
@@ -109,10 +96,7 @@ def create_event(event:KavachEvent,user:User=Depends(roles(Role.ADMIN,Role.SECUR
     }
     if user.role != Role.ADMIN and event.source_module.value not in permitted_sources.get(user.role, set()):
         raise HTTPException(403,"Role may only submit events for its assigned module")
-    values=event.model_dump()
-    values.update(event_id=str(event.event_id),timestamp=event.timestamp)
-    values={k:(v.value if hasattr(v,"value") else v) for k,v in values.items()}
-    e=KavachEventRecord(**values); db.add(e); db.commit(); audit(db,user.id,"event.create","event","success",rid=str(event.event_id)); return event
+    add_event(db,event,user.id); db.commit(); return event
 @router.get("/decisions")
 def decisions(user:User=Depends(current_user),db:Session=Depends(get_db)):
     return [{"id":x.id,"event_id":x.event_id,"selected_action":x.selected_action,"policy_rule_id":x.policy_rule_id,"explanation":x.explanation,"input_scores":x.input_scores,"timestamp":x.timestamp} for x in db.scalars(select(DecisionRecord).order_by(DecisionRecord.timestamp.desc()).limit(100)).all()]

@@ -1,6 +1,6 @@
 # KAVACHNET module integration contracts
 
-This document describes the shared backend boundaries for parallel module work. The Security, Edge AI, and Network Resilience algorithms and their ingest APIs are not implemented by this contract.
+This document describes shared backend boundaries for parallel module work. Security and Edge AI algorithms remain unimplemented. Network Resilience currently implements a synthetic simulator and store-and-forward demo, not real network monitoring or guaranteed remote delivery.
 
 ## Shared event
 
@@ -37,10 +37,10 @@ Implementations belong in module-owned services and must satisfy `backend/app/se
 |---|---|---|---|
 | Security | detection, sanitization/blocking decisions, security evidence | `SecurityDetectionService.inspect` | authenticated security inspection/ingest and security event history |
 | Edge AI | sensor validation, anomaly detection, model metadata | `SensorAnomalyService.analyze` | sensor ingest, anomaly history, model/version reporting |
-| Network Resilience | network health, queue/delivery observations, resilience simulation | `NetworkMonitoringService.snapshot` | health snapshots, queue/delivery state, simulation controls |
+| Network Resilience | synthetic health scoring, queue/delivery observations, resilience simulation | `NetworkMonitoringService.snapshot` implemented by `app.modules.network_resilience.monitor.NetworkMonitor` | REST APIs are implemented under `/api/v1/network`; no server WebSocket endpoint |
 | Platform | shared schemas, auth, event persistence, policy interface, audit | `DecisionEngine`, `EventPublisher`, `WebSocketService` | event status transition/acknowledgment, decision creation/preview, authenticated WebSocket endpoint |
 
-The current `POST /api/v1/events` is the shared event write endpoint. It persists the event and then audits it. Module integrations should use this common event shape and must not write event rows directly. Publishing is not wired to persistence: any future publisher should run after commit, and durable delivery requires an outbox or equivalent. The frontend WebSocket helper currently has no matching backend endpoint or reconnect/delivery contract.
+The current `POST /api/v1/events` is the shared event write endpoint. It persists and audits the event in one transaction through `app.services.event_store.add_event`. Network state events use the same adapter. Module integrations should use this common event shape and must not write event rows directly. General event publishing is not wired to persistence: any future publisher should run after commit, and durable broadcast delivery requires an outbox or equivalent. The frontend WebSocket helper currently has no matching backend endpoint or reconnect/delivery contract; the network page polls REST.
 
 ## API access boundary
 

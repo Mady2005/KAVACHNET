@@ -1,6 +1,6 @@
 import enum, uuid
 from datetime import datetime, timezone
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Integer, JSON, String, Text, Float, Uuid
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Integer, JSON, String, Text, Float, Uuid, LargeBinary, UniqueConstraint, CheckConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from app.db.base import Base
 
@@ -39,3 +39,58 @@ class DatasetRegistry(Base):
 class RevokedToken(Base):
     __tablename__="revoked_tokens"
     jti: Mapped[str]=mapped_column(String(36), primary_key=True); expires_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), index=True)
+class NetworkTelemetryRecord(Base):
+    __tablename__="network_telemetry"
+    id: Mapped[int]=mapped_column(Integer, primary_key=True)
+    scenario: Mapped[str]=mapped_column(String(20), index=True)
+    state: Mapped[str]=mapped_column(String(20), index=True)
+    timestamp: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=now, index=True)
+    latency_ms: Mapped[float]=mapped_column(Float)
+    packet_loss_pct: Mapped[float]=mapped_column(Float)
+    bandwidth_mbps: Mapped[float]=mapped_column(Float)
+    connected: Mapped[bool]=mapped_column(Boolean)
+    jitter_ms: Mapped[float|None]=mapped_column(Float, nullable=True)
+    delivery_failure_rate_pct: Mapped[float]=mapped_column(Float, default=0)
+    health_score: Mapped[float]=mapped_column(Float)
+    reason: Mapped[str]=mapped_column(String(500))
+    __table_args__=(
+        CheckConstraint("latency_ms >= 0", name="ck_network_telemetry_latency"),
+        CheckConstraint("packet_loss_pct >= 0 AND packet_loss_pct <= 100", name="ck_network_telemetry_loss"),
+        CheckConstraint("bandwidth_mbps >= 0", name="ck_network_telemetry_bandwidth"),
+        CheckConstraint("delivery_failure_rate_pct >= 0 AND delivery_failure_rate_pct <= 100", name="ck_network_telemetry_failure_rate"),
+        CheckConstraint("health_score >= 0 AND health_score <= 100", name="ck_network_telemetry_health"),
+    )
+class NetworkMessageRecord(Base):
+    __tablename__="network_messages"
+    message_id: Mapped[str]=mapped_column(String(36), primary_key=True, default=lambda:str(uuid.uuid4()))
+    idempotency_key: Mapped[str|None]=mapped_column(String(100), nullable=True, unique=True)
+    payload_sha256: Mapped[str]=mapped_column(String(64))
+    payload_blob: Mapped[bytes]=mapped_column(LargeBinary)
+    payload_encoding: Mapped[str]=mapped_column(String(20), default="identity")
+    compression_algorithm: Mapped[str|None]=mapped_column(String(20), nullable=True)
+    original_size: Mapped[int]=mapped_column(Integer)
+    stored_size: Mapped[int]=mapped_column(Integer)
+    priority: Mapped[str]=mapped_column(String(2), index=True)
+    state: Mapped[str]=mapped_column(String(20), default="PENDING", index=True)
+    attempts: Mapped[int]=mapped_column(Integer, default=0)
+    created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=now, index=True)
+    updated_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+    next_attempt_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    last_attempt_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True), nullable=True)
+    delivered_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), index=True)
+    last_error_category: Mapped[str|None]=mapped_column(String(80), nullable=True)
+    __table_args__=(
+        CheckConstraint("original_size >= 0 AND stored_size >= 0", name="ck_network_message_sizes"),
+        CheckConstraint("attempts >= 0", name="ck_network_message_attempts"),
+    )
+class NetworkDeliveryAttempt(Base):
+    __tablename__="network_delivery_attempts"
+    id: Mapped[int]=mapped_column(Integer, primary_key=True)
+    message_id: Mapped[str]=mapped_column(ForeignKey("network_messages.message_id", ondelete="CASCADE"), index=True)
+    attempt_number: Mapped[int]=mapped_column(Integer)
+    attempted_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=now, index=True)
+    outcome: Mapped[str]=mapped_column(String(20))
+    error_category: Mapped[str|None]=mapped_column(String(80), nullable=True)
+    latency_ms: Mapped[float|None]=mapped_column(Float, nullable=True)
+    __table_args__=(UniqueConstraint("message_id","attempt_number",name="uq_network_attempt_number"),)
