@@ -1,0 +1,2 @@
+# Optional local Isolation Forest inference. Install after the core backend requirements.
+scikit-learn>=1.5,<2

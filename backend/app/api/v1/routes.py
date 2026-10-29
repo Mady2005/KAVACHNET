@@ -6,6 +6,7 @@ from time import monotonic
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 import jwt
 from app.auth.security import issue_token, hash_password, verify_password
@@ -101,7 +102,7 @@ def event_detail(event_id:str,user:User=Depends(current_user),db:Session=Depends
     if not e: raise HTTPException(404,"Event not found")
     return event_dict(e)
 @router.post("/events",status_code=201)
-def create_event(event:KavachEvent,user:User=Depends(roles(Role.ADMIN,Role.SECURITY_ANALYST,Role.EDGE_OPERATOR,Role.NETWORK_OPERATOR)),db:Session=Depends(get_db)):
+def create_event(event:KavachEvent,response:Response,user:User=Depends(roles(Role.ADMIN,Role.SECURITY_ANALYST,Role.EDGE_OPERATOR,Role.NETWORK_OPERATOR)),db:Session=Depends(get_db)):
     permitted_sources={
         Role.SECURITY_ANALYST: {"SECURITY"},
         Role.EDGE_OPERATOR: {"EDGE_AI"},
@@ -109,10 +110,45 @@ def create_event(event:KavachEvent,user:User=Depends(roles(Role.ADMIN,Role.SECUR
     }
     if user.role != Role.ADMIN and event.source_module.value not in permitted_sources.get(user.role, set()):
         raise HTTPException(403,"Role may only submit events for its assigned module")
-    values=event.model_dump()
+    existing=db.get(KavachEventRecord,str(event.event_id))
+    if existing:
+        stored = _replay_or_conflict(existing,event,response)
+        _correlate_event(str(event.event_id), user, response, db)
+        return stored
+    values=event.model_dump(mode="json")
     values.update(event_id=str(event.event_id),timestamp=event.timestamp)
     values={k:(v.value if hasattr(v,"value") else v) for k,v in values.items()}
-    e=KavachEventRecord(**values); db.add(e); db.commit(); audit(db,user.id,"event.create","event","success",rid=str(event.event_id)); return event
+    e=KavachEventRecord(**values); db.add(e)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        existing=db.get(KavachEventRecord,str(event.event_id))
+        if existing:
+            return _replay_or_conflict(existing,event,response)
+        raise HTTPException(409,"Event could not be created because of a concurrent conflict")
+    audit(db,user.id,"event.create","event","success",rid=str(event.event_id))
+    _correlate_event(str(event.event_id), user, response, db)
+    return event
+
+def _correlate_event(event_id, user, response, db):
+    from app.modules.edge_ai.correlation_service import correlate_persisted_event
+    try:
+        incident = correlate_persisted_event(db, event_id, actor_user_id=getattr(user, "id", None))
+    except Exception as exc:
+        response.headers["X-Persisted-Event-ID"] = event_id
+        raise HTTPException(503, "Event persisted; incident correlation failed. Retry the same event_id.", headers={"X-Persisted-Event-ID": event_id}) from exc
+    if incident:
+        response.headers["X-Incident-ID"] = incident.incident_id
+        response.headers["X-Incident-Status"] = incident.status
+
+def _replay_or_conflict(existing:KavachEventRecord,event:KavachEvent,response:Response):
+    stored=KavachEvent.model_validate(event_dict(existing))
+    if stored.model_dump(mode="json") != event.model_dump(mode="json"):
+        raise HTTPException(409,"event_id is already associated with a different event payload")
+    response.status_code=200
+    response.headers["Idempotency-Replayed"]="true"
+    return stored
 @router.get("/decisions")
 def decisions(user:User=Depends(current_user),db:Session=Depends(get_db)):
     return [{"id":x.id,"event_id":x.event_id,"selected_action":x.selected_action,"policy_rule_id":x.policy_rule_id,"explanation":x.explanation,"input_scores":x.input_scores,"timestamp":x.timestamp} for x in db.scalars(select(DecisionRecord).order_by(DecisionRecord.timestamp.desc()).limit(100)).all()]

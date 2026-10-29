@@ -1,5 +1,5 @@
 from pathlib import Path
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     cookie_secure: bool = False
     registration_enabled: bool = False
     allowed_origins: str = "http://localhost:5173"
+    incident_correlation_window_seconds: int = Field(default=900, ge=60, le=86400)
 
     @property
     def resolved_database_url(self) -> str:
