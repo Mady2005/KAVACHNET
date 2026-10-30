@@ -53,6 +53,7 @@ class NetworkTelemetryRecord(Base):
     delivery_failure_rate_pct: Mapped[float]=mapped_column(Float, default=0)
     health_score: Mapped[float]=mapped_column(Float)
     reason: Mapped[str]=mapped_column(String(500))
+    source_type: Mapped[str]=mapped_column(String(24), default="SIMULATED", server_default="SIMULATED", nullable=False, index=True)
     __table_args__=(
         CheckConstraint("latency_ms >= 0", name="ck_network_telemetry_latency"),
         CheckConstraint("packet_loss_pct >= 0 AND packet_loss_pct <= 100", name="ck_network_telemetry_loss"),
@@ -60,6 +61,62 @@ class NetworkTelemetryRecord(Base):
         CheckConstraint("delivery_failure_rate_pct >= 0 AND delivery_failure_rate_pct <= 100", name="ck_network_telemetry_failure_rate"),
         CheckConstraint("health_score >= 0 AND health_score <= 100", name="ck_network_telemetry_health"),
     )
+
+class NetworkObservationRecord(Base):
+    """One normalized, provenance-bearing measurement; null means unavailable."""
+    __tablename__="network_observations"
+    id: Mapped[str]=mapped_column(String(36), primary_key=True, default=lambda:str(uuid.uuid4()))
+    timestamp_utc: Mapped[datetime]=mapped_column(DateTime(timezone=True), index=True)
+    source_type: Mapped[str]=mapped_column(String(24), index=True)
+    source_name: Mapped[str]=mapped_column(String(200), index=True)
+    measurement_type: Mapped[str]=mapped_column(String(80), index=True)
+    value: Mapped[float|None]=mapped_column(Float, nullable=True)
+    unit: Mapped[str]=mapped_column(String(32))
+    target_label: Mapped[str|None]=mapped_column(String(120), nullable=True, index=True)
+    measurement_method: Mapped[str]=mapped_column(String(200))
+    collection_interval_seconds: Mapped[float|None]=mapped_column(Float, nullable=True)
+    dataset_version: Mapped[str|None]=mapped_column(String(100), nullable=True)
+    experiment_id: Mapped[str|None]=mapped_column(String(100), nullable=True, index=True)
+    dataset_id: Mapped[str|None]=mapped_column(ForeignKey("dataset_registry.dataset_id"), nullable=True, index=True)
+    observation_metadata: Mapped[dict]=mapped_column("metadata", JSON, default=dict)
+    created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=now, index=True)
+    __table_args__=(
+        CheckConstraint("source_type IN ('REAL_MEASUREMENT','PUBLIC_DATASET','SIMULATED','RIPE_ATLAS_PUBLIC')",name="ck_network_observation_source"),
+        CheckConstraint("value IS NULL OR value >= 0",name="ck_network_observation_value"),
+    )
+
+class NetworkMeasurementRun(Base):
+    __tablename__="network_measurement_runs"
+    run_id: Mapped[str]=mapped_column(String(36), primary_key=True, default=lambda:str(uuid.uuid4()))
+    status: Mapped[str]=mapped_column(String(20), index=True, default="PENDING")
+    target_label: Mapped[str]=mapped_column(String(120))
+    requested_by: Mapped[str]=mapped_column(ForeignKey("users.id"), index=True)
+    requested_samples: Mapped[int]=mapped_column(Integer)
+    interval_seconds: Mapped[float]=mapped_column(Float)
+    started_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=now)
+    ended_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True), nullable=True)
+    successful_probes: Mapped[int]=mapped_column(Integer, default=0)
+    failed_probes: Mapped[int]=mapped_column(Integer, default=0)
+    error_categories: Mapped[dict]=mapped_column(JSON, default=dict)
+
+class PublicMeasurementIngestionRun(Base):
+    __tablename__="public_measurement_ingestion_runs"
+    run_id: Mapped[str]=mapped_column(String(36), primary_key=True, default=lambda:str(uuid.uuid4()))
+    provider: Mapped[str]=mapped_column(String(40), nullable=False, default="RIPE Atlas")
+    measurement_id: Mapped[str]=mapped_column(String(20), nullable=False, index=True)
+    status: Mapped[str]=mapped_column(String(20), nullable=False, index=True)
+    requested_by: Mapped[str]=mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    started_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=now, nullable=False)
+    ended_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True), nullable=True)
+    window_start: Mapped[datetime]=mapped_column(DateTime(timezone=True), nullable=False)
+    window_end: Mapped[datetime]=mapped_column(DateTime(timezone=True), nullable=False)
+    retrieved_count: Mapped[int]=mapped_column(Integer, default=0, nullable=False)
+    accepted_count: Mapped[int]=mapped_column(Integer, default=0, nullable=False)
+    rejected_count: Mapped[int]=mapped_column(Integer, default=0, nullable=False)
+    deduplicated_count: Mapped[int]=mapped_column(Integer, default=0, nullable=False)
+    observations_inserted_count: Mapped[int]=mapped_column(Integer, default=0, nullable=False)
+    observations_deduplicated_count: Mapped[int]=mapped_column(Integer, default=0, nullable=False)
+    errors: Mapped[list]=mapped_column(JSON, default=list, nullable=False)
 class NetworkMessageRecord(Base):
     __tablename__="network_messages"
     message_id: Mapped[str]=mapped_column(String(36), primary_key=True, default=lambda:str(uuid.uuid4()))

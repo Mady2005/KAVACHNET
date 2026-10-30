@@ -24,6 +24,21 @@ class Settings(BaseSettings):
     network_health_latency_weight: float = Field(default=0.35, ge=0, le=1)
     network_health_delivery_weight: float = Field(default=0.40, ge=0, le=1)
     network_health_bandwidth_weight: float = Field(default=0.25, ge=0, le=1)
+    network_measurement_enabled: bool = False
+    network_measurement_target_url: str = Field(default="", max_length=2048)
+    network_measurement_target_label: str = Field(default="", max_length=120)
+    network_measurement_timeout_seconds: float = Field(default=3.0, gt=0, le=10)
+    network_measurement_interval_seconds: float = Field(default=1.0, ge=0.5, le=10)
+    network_measurement_max_samples: int = Field(default=20, ge=1, le=100)
+    network_ack_test_url: str = Field(default="", max_length=2048)
+    network_throughput_test_url: str = Field(default="", max_length=2048)
+    network_throughput_max_bytes: int = Field(default=1048576, ge=1024, le=1048576)
+    network_throughput_max_seconds: float = Field(default=5.0, gt=0, le=15)
+    ripe_atlas_enabled: bool = False
+    ripe_atlas_measurement_id: str = Field(default="", max_length=20)
+    ripe_atlas_timeout_seconds: float = Field(default=10.0, gt=0, le=30)
+    ripe_atlas_max_results: int = Field(default=500, ge=1, le=5000)
+    ripe_atlas_lookback_hours: int = Field(default=24, ge=1, le=720)
 
     @property
     def resolved_database_url(self) -> str:

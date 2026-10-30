@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-from app.models import AuditLog, NetworkTelemetryRecord
+from app.models import AuditLog, NetworkObservationRecord, NetworkTelemetryRecord
 from app.schemas.events import Action, EventStatus, KavachEvent, Priority, Severity, SourceModule
 from app.schemas.network import NetworkScenario, TelemetryInput
 from app.services.event_store import add_event
@@ -31,6 +31,8 @@ def apply_telemetry(db:Session,telemetry:TelemetryInput,scenario:str,reason:str,
     previous=latest_telemetry(db)
     record=NetworkTelemetryRecord(scenario=scenario,state=score.state.value,timestamp=now,latency_ms=telemetry.latency_ms,packet_loss_pct=telemetry.packet_loss_pct,bandwidth_mbps=telemetry.bandwidth_mbps,connected=telemetry.connected,jitter_ms=telemetry.jitter_ms,delivery_failure_rate_pct=telemetry.delivery_failure_rate_pct,health_score=score.score,reason=reason or telemetry.reason)
     db.add(record); db.flush()
+    for metric,value,unit in (("round_trip_latency",telemetry.latency_ms,"ms"),("packet_loss",telemetry.packet_loss_pct,"percent"),("throughput",telemetry.bandwidth_mbps,"Mbps"),("jitter",telemetry.jitter_ms,"ms"),("application_delivery_failure",telemetry.delivery_failure_rate_pct,"percent"),("network_health_score",score.score,"score")):
+        db.add(NetworkObservationRecord(timestamp_utc=now,source_type="SIMULATED",source_name="controlled_simulator",measurement_type=metric,value=value,unit=unit,target_label="simulated-channel",measurement_method="controlled scenario generator",experiment_id=None,observation_metadata={"scenario":scenario,"telemetry_record_id":record.id}))
     changed=(previous is None or previous.state!=record.state or previous.connected!=record.connected or record.state=="disconnected" or (previous.state=="disconnected" and record.connected))
     if changed: add_event(db,_event(record),actor_user_id)
     db.add(AuditLog(actor_user_id=actor_user_id,action="network.simulator.change",resource_type="network_telemetry",resource_id=str(record.id),outcome="success",details={"scenario":scenario,"state":record.state,"health_score":record.health_score,"simulated":True}))

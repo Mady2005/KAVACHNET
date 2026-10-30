@@ -1,1 +1,1 @@
-from app.models.entities import User, AuditLog, KavachEventRecord, DecisionRecord, SystemSetting, DatasetRegistry, RevokedToken, Role, NetworkTelemetryRecord, NetworkMessageRecord, NetworkDeliveryAttempt
+from app.models.entities import User, AuditLog, KavachEventRecord, DecisionRecord, SystemSetting, DatasetRegistry, RevokedToken, Role, NetworkTelemetryRecord, NetworkMessageRecord, NetworkDeliveryAttempt, NetworkObservationRecord, NetworkMeasurementRun, PublicMeasurementIngestionRun

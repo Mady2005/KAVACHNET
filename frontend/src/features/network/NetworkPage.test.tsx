@@ -12,6 +12,7 @@ const metrics={delivery_success_rate_pct:null,success_rate_denominator:'delivere
 
 beforeEach(()=>{api.request.mockReset();api.request.mockImplementation(async(path:string,init?:RequestInit)=>{
  if(path==='/network/status')return status;
+ if(path.startsWith('/network/evaluation?'))return {source_type:'SIMULATED',status:'NO_SIMULATION_DATA',observation_count:0,collection_window:{started_at:null,ended_at:null},metrics:{},runs:[],datasets:[]};
  if(path.startsWith('/network/messages?'))return queue;
  if(path==='/network/metrics')return metrics;
  if(path==='/network/simulator/scenario'&&init?.method==='POST')return {telemetry:status.telemetry,delivery:{delivered:0}};
@@ -34,5 +35,12 @@ describe('Network resilience page',()=>{
   render(<NetworkPage user={{role:'VIEWER'}}/>);
   expect(await screen.findByRole('button',{name:'healthy'})).toBeDisabled();
   expect(screen.getByRole('button',{name:/enqueue message/i})).toBeDisabled();
+ });
+ it('keeps public dataset imports in their own source view',async()=>{
+  const user=userEvent.setup();render(<NetworkPage user={{role:'NETWORK_OPERATOR'}}/>);
+  await user.click(await screen.findByRole('button',{name:'Public dataset'}));
+  expect(screen.getByLabelText('Local CSV or JSON')).toBeInTheDocument();
+  expect(await screen.findByText(/No public dataset observations imported yet/i)).toBeInTheDocument();
+  expect(screen.queryByRole('heading',{name:'Apply a scenario'})).not.toBeInTheDocument();
  });
 });

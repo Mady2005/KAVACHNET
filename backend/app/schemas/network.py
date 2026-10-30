@@ -96,6 +96,71 @@ class TelemetryPage(BaseModel):
     offset: int
     limit: int
 
+class ObservationOut(BaseModel):
+    id: str
+    timestamp_utc: datetime
+    source_type: str
+    source_name: str
+    measurement_type: str
+    value: float|None
+    unit: str
+    target_label: str|None
+    measurement_method: str
+    collection_interval_seconds: float|None
+    dataset_version: str|None
+    experiment_id: str|None
+    dataset_id: str|None
+    metadata: dict
+
+    @field_validator("timestamp_utc")
+    @classmethod
+    def observation_time_utc(cls,value):
+        if value.tzinfo is None or value.utcoffset() is None:return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+class ObservationPage(BaseModel):
+    items: list[ObservationOut]
+    offset: int
+    limit: int
+    total: int
+
+class MeasurementRunRequest(BaseModel):
+    model_config=ConfigDict(extra="forbid")
+    samples: int=Field(ge=1,le=100)
+
+class MeasurementRunOut(BaseModel):
+    run_id: str
+    status: str
+    target_label: str
+    requested_samples: int
+    interval_seconds: float
+    started_at: datetime
+    ended_at: datetime|None
+    successful_probes: int
+    failed_probes: int
+    error_categories: dict
+
+    @field_validator("started_at","ended_at")
+    @classmethod
+    def run_times_utc(cls,value):
+        if value is None:return None
+        if value.tzinfo is None or value.utcoffset() is None:return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+class DatasetImportOut(BaseModel):
+    dataset_id: str
+    name: str
+    source_url: str|None
+    license: str|None
+    import_status: str
+    imported_rows: int
+    accepted_rows: int
+    rejected_rows: int
+    rejected: list[dict]
+    supported_fields: list[str]
+    unsupported_operational_metrics: list[str]
+    sha256: str
+
 class MessageOut(BaseModel):
     message_id: str
     priority: Priority

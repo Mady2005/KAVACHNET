@@ -1,0 +1,3 @@
+timestamp_utc,measurement_type,value,unit,measurement_method
+2026-10-26T10:00:00Z,flow_duration,250,microseconds,synthetic test fixture
+not-a-time,round_trip_latency,15,ms,synthetic test fixture
