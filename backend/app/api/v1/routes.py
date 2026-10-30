@@ -1,9 +1,12 @@
 from datetime import datetime, timezone
 from collections import defaultdict, deque
+import json
 import secrets
 from threading import Lock
 from time import monotonic
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -14,8 +17,14 @@ from app.db.session import get_db, engine
 from app.models import User, AuditLog, KavachEventRecord, DecisionRecord, DatasetRegistry, RevokedToken, Role
 from app.schemas.events import KavachEvent
 from app.schemas.api import UserOut, DatasetIn, DatasetOut, DatasetPatch, LoginIn, LoginOut, RegisterIn, RoleUpdateIn
+from app.modules.security.service import (
+    InspectionFailure,
+    SecurityInspectionService,
+)
 
 router=APIRouter(); bearer=HTTPBearer(auto_error=False)
+security_service=SecurityInspectionService()
+_MAX_SECURITY_BODY_BYTES=1_000_000
 _login_failures=defaultdict(deque); _login_lock=Lock(); _LOGIN_WINDOW_SECONDS=900; _LOGIN_MAX_FAILURES=5
 def audit(db, actor, action, resource, outcome, details=None, rid=None):
     db.add(AuditLog(actor_user_id=actor,action=action,resource_type=resource,resource_id=rid,outcome=outcome,details=details or {})); db.commit()
@@ -91,6 +100,110 @@ def event_dict(e):
     stamp=values["timestamp"]
     values["timestamp"]=stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None else stamp.astimezone(timezone.utc)
     return values
+
+
+async def _read_security_payload(request: Request):
+    """Read bounded JSON without FastAPI body-model errors echoing user input."""
+    content_length=request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length=int(content_length)
+        except ValueError:
+            return None, JSONResponse(status_code=400,content={"detail":"Invalid request body"})
+        if declared_length < 0:
+            return None, JSONResponse(status_code=400,content={"detail":"Invalid request body"})
+        if declared_length > _MAX_SECURITY_BODY_BYTES:
+            return None, JSONResponse(status_code=413,content={"detail":"Request body is too large"})
+
+    body=bytearray()
+    async for chunk in request.stream():
+        if len(body)+len(chunk) > _MAX_SECURITY_BODY_BYTES:
+            del body
+            return None, JSONResponse(status_code=413,content={"detail":"Request body is too large"})
+        body.extend(chunk)
+
+    try:
+        payload=json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+        del body
+        return None, JSONResponse(status_code=400,content={"detail":"Invalid JSON request body"})
+    del body
+    return payload, None
+
+
+def _persist_event(event:KavachEvent,user:User,db:Session):
+    """Use the existing source authorization, event commit, and audit sequence."""
+    permitted_sources={
+        Role.SECURITY_ANALYST: {"SECURITY"},
+        Role.EDGE_OPERATOR: {"EDGE_AI"},
+        Role.NETWORK_OPERATOR: {"NETWORK"},
+    }
+    if user.role != Role.ADMIN and event.source_module.value not in permitted_sources.get(user.role, set()):
+        raise HTTPException(403,"Role may only submit events for its assigned module")
+    values=event.model_dump()
+    values.update(event_id=str(event.event_id),timestamp=event.timestamp)
+    values={k:(v.value if hasattr(v,"value") else v) for k,v in values.items()}
+    record=KavachEventRecord(**values)
+    db.add(record)
+    db.commit()
+    # Preserve the established separate audit commit and its transaction behavior.
+    audit(db,user.id,"event.create","event","success",rid=str(event.event_id))
+    return event
+
+
+@router.post("/security/inspect",status_code=201)
+async def inspect_security(
+    request:Request,
+    user:User=Depends(roles(Role.ADMIN,Role.SECURITY_ANALYST)),
+    db:Session=Depends(get_db),
+):
+    payload,body_error=await _read_security_payload(request)
+    if body_error is not None:
+        return body_error
+
+    try:
+        outcome=security_service.inspect_result(payload)
+    finally:
+        del payload
+    if isinstance(outcome,InspectionFailure):
+        return JSONResponse(
+            status_code=outcome.status_code,
+            content={"detail":list(outcome.errors)},
+        )
+
+    event=outcome.event
+    del outcome
+    persisted_event=_persist_event(event,user,db)
+    return JSONResponse(
+        status_code=201,
+        content=jsonable_encoder({
+            "event":persisted_event,
+            "findings":persisted_event.evidence.get("findings",[]),
+        }),
+    )
+
+
+@router.get("/security/events")
+def security_events(
+    offset:int=0,
+    limit:int=50,
+    user:User=Depends(roles(Role.ADMIN,Role.SECURITY_ANALYST)),
+    db:Session=Depends(get_db),
+):
+    if offset<0 or limit<1 or limit>100:
+        raise HTTPException(422,"offset must be non-negative and limit must be between 1 and 100")
+    source_filter=KavachEventRecord.source_module=="SECURITY"
+    total=db.scalar(select(func.count()).select_from(KavachEventRecord).where(source_filter)) or 0
+    records=db.scalars(
+        select(KavachEventRecord)
+        .where(source_filter)
+        .order_by(KavachEventRecord.timestamp.desc(),KavachEventRecord.event_id.desc())
+        .offset(offset)
+        .limit(limit)
+    ).all()
+    return {"items":[event_dict(record) for record in records],"offset":offset,"limit":limit,"total":total}
+
+
 @router.get("/events")
 def events(offset:int=0,limit:int=50,user:User=Depends(current_user),db:Session=Depends(get_db)):
     if limit>200: raise HTTPException(422,"limit must be at most 200")
@@ -102,17 +215,7 @@ def event_detail(event_id:str,user:User=Depends(current_user),db:Session=Depends
     return event_dict(e)
 @router.post("/events",status_code=201)
 def create_event(event:KavachEvent,user:User=Depends(roles(Role.ADMIN,Role.SECURITY_ANALYST,Role.EDGE_OPERATOR,Role.NETWORK_OPERATOR)),db:Session=Depends(get_db)):
-    permitted_sources={
-        Role.SECURITY_ANALYST: {"SECURITY"},
-        Role.EDGE_OPERATOR: {"EDGE_AI"},
-        Role.NETWORK_OPERATOR: {"NETWORK"},
-    }
-    if user.role != Role.ADMIN and event.source_module.value not in permitted_sources.get(user.role, set()):
-        raise HTTPException(403,"Role may only submit events for its assigned module")
-    values=event.model_dump()
-    values.update(event_id=str(event.event_id),timestamp=event.timestamp)
-    values={k:(v.value if hasattr(v,"value") else v) for k,v in values.items()}
-    e=KavachEventRecord(**values); db.add(e); db.commit(); audit(db,user.id,"event.create","event","success",rid=str(event.event_id)); return event
+    return _persist_event(event,user,db)
 @router.get("/decisions")
 def decisions(user:User=Depends(current_user),db:Session=Depends(get_db)):
     return [{"id":x.id,"event_id":x.event_id,"selected_action":x.selected_action,"policy_rule_id":x.policy_rule_id,"explanation":x.explanation,"input_scores":x.input_scores,"timestamp":x.timestamp} for x in db.scalars(select(DecisionRecord).order_by(DecisionRecord.timestamp.desc()).limit(100)).all()]

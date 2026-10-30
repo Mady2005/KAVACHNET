@@ -1,10 +1,10 @@
-# KAVACHNET module integration contracts
+# KAVACHNET integration contracts
 
-This document describes the shared backend boundaries for parallel module work. The Security, Edge AI, and Network Resilience algorithms and their ingest APIs are not implemented by this contract.
+This document records the current shared event contract and module integration boundaries. It describes Security's current inspection integration and the shared seams available to Edge AI and Network Resilience; it does not change those modules' ownership or behavior.
 
-## Shared event
+## Canonical event contract
 
-`backend/app/schemas/events.py::KavachEvent` is the canonical event payload. It requires a UUID `event_id`, timezone-aware `timestamp` normalized to UTC, `source_module`, `event_type` (1–100 characters), `severity`, `security_risk` and `situation_risk` in `[0, 1]`, `network_health` in `[0, 100]`, `priority`, and `recommended_action`. `evidence` defaults to `{}`, `confidence` is optional in `[0, 1]`, `status` defaults to `NEW`, `correlation_id` is optional (max 100), and `simulation` defaults to false. Unknown fields are rejected and non-finite numeric values are invalid.
+`backend/app/schemas/events.py::KavachEvent` is the shared event payload. It requires a UUID `event_id`, timezone-aware timestamp normalized to UTC, `source_module`, `event_type` (1–100 characters), `severity`, `security_risk` in `[0,1]`, `situation_risk`, `network_health`, `priority`, and `recommended_action`. `evidence` defaults to `{}`; `confidence` and `correlation_id` are optional; `status` defaults to `NEW`; `simulation` defaults to `false`. Unknown fields and non-finite numeric values are rejected.
 
 Enums:
 
@@ -14,13 +14,17 @@ Enums:
 - Action: `ALLOW`, `WARN`, `SANITIZE`, `BLOCK`, `QUARANTINE`, `ALERT`, `SUMMARIZE`, `COMPRESS`, `PRIORITIZE`, `STORE`, `FORWARD`
 - Status: `NEW`, `ACKNOWLEDGED`, `QUEUED`, `DELIVERED`, `BLOCKED`, `RESOLVED`
 
-The API validates event payloads, but the database currently stores enum fields as strings and has no equivalent check constraints. Priority assignment, score semantics, and status-transition rules remain shared-contract decisions and must be agreed before modules rely on them.
+### Source-aware nullable metrics
 
-## Current service protocols
+Both `situation_risk` and `network_health` remain required event fields. For `SECURITY`, both may be numeric or both may be `null`, which means those metrics are not applicable to that inspection. A mixed numeric/null pair is rejected. Every non-Security source must continue to provide numeric values for both fields. SQLAlchemy columns are nullable to store Security events; source-aware rules are enforced by the Pydantic event contract.
 
-Implementations belong in module-owned services and must satisfy `backend/app/services/interfaces.py`:
+Alembic revision `0002_security_nullable` is a single-head child of the unchanged `0001_initial`. It relaxes database nullability without rewriting existing data. Downgrade refuses while any event row has either metric null and does not fill replacement values. Apply with `alembic upgrade head` from `backend/`; migration tests cover fresh and legacy databases.
 
-| Protocol | Required interface |
+## Service protocols
+
+Implementations belong in owner-specific service areas and satisfy `backend/app/services/interfaces.py`:
+
+| Protocol | Interface |
 |---|---|
 | Security detection | `inspect(payload: dict) -> KavachEvent` |
 | Edge sensor anomaly | `analyze(reading: dict) -> KavachEvent` |
@@ -29,27 +33,81 @@ Implementations belong in module-owned services and must satisfy `backend/app/se
 | Event publisher | `async publish(event: KavachEvent) -> None` |
 | WebSocket service | `async broadcast(event: KavachEvent) -> None` |
 
-`DecisionResult` carries `selected_action`, `policy_rule_id`, `explanation`, `input_scores`, and a UTC `timestamp`. It records a recommendation; it does not authorize or execute external actions. Policy implementations must not bypass the responsible module's authorization and safety checks.
+`DecisionResult` carries `selected_action`, `policy_rule_id`, `explanation`, `input_scores`, and a UTC timestamp. A recommendation does not itself authorize or execute an external action.
 
-## Ownership and future API work
+## Security inspection integration
 
-| Owner | Owns | Current seam | API still needed (not implemented) |
-|---|---|---|---|
-| Security | detection, sanitization/blocking decisions, security evidence | `SecurityDetectionService.inspect` | authenticated security inspection/ingest and security event history |
-| Edge AI | sensor validation, anomaly detection, model metadata | `SensorAnomalyService.analyze` | sensor ingest, anomaly history, model/version reporting |
-| Network Resilience | network health, queue/delivery observations, resilience simulation | `NetworkMonitoringService.snapshot` | health snapshots, queue/delivery state, simulation controls |
-| Platform | shared schemas, auth, event persistence, policy interface, audit | `DecisionEngine`, `EventPublisher`, `WebSocketService` | event status transition/acknowledgment, decision creation/preview, authenticated WebSocket endpoint |
+Security implements the protocol in `backend/app/modules/security/service.py`. `inspect_result(payload)` is the non-raising result path used by the HTTP route to avoid propagating sensitive validation or detector tracebacks. The service validates a strict object containing only `content` and optional `kind`, builds a `KavachEvent`, and does not write to the database.
 
-The current `POST /api/v1/events` is the shared event write endpoint. It persists the event and then audits it. Module integrations should use this common event shape and must not write event rows directly. Publishing is not wired to persistence: any future publisher should run after commit, and durable delivery requires an outbox or equivalent. The frontend WebSocket helper currently has no matching backend endpoint or reconnect/delivery contract.
+### Field mapping
 
-## API access boundary
+| Event field | Security mapping |
+|---|---|
+| `event_id`, `timestamp`, `correlation_id` | Generated by server |
+| `source_module`, `event_type` | `SECURITY`, `security.inspection` |
+| `security_risk`, `severity` | Deterministic inspection score and classification |
+| `situation_risk`, `network_health`, `confidence` | `null` |
+| `priority` | CRITICAL=P0, HIGH=P1, MEDIUM=P2, LOW/INFO=P3 |
+| `recommended_action` | INFO=ALLOW, LOW/MEDIUM=WARN, HIGH/CRITICAL=ALERT |
+| `status`, `simulation` | `NEW`, `false` |
 
-The shared event write route now binds `SECURITY_ANALYST` to `SECURITY`, `EDGE_OPERATOR` to `EDGE_AI`, and `NETWORK_OPERATOR` to `NETWORK`; `ADMIN` may submit any source, including `SYSTEM`. A module must not impersonate another module by selecting a different `source_module`. Existing event/decision/dataset read routes remain globally readable to authenticated users for compatibility; module-scoped read access is a separate authorization change.
+Every successful inspection creates an event, including benign inspections with no findings. Actions are advisory; inspection does not block, quarantine, or enforce.
 
-## Integration sequence
+### API surface and roles
 
-1. Agree on score meanings, priority mapping, allowed status transitions, and module role mapping.
-2. Keep module code in owner-specific service/package areas; shared schema, auth, database, and API changes require coordinated review.
-3. Add explicit migrations and contract tests before changing stored event fields or enum constraints.
-4. Centralize event persistence, publish only after commit, and define delivery/retry behavior before enabling live frontend updates.
-5. Add module-specific routes only with typed request/response schemas and role checks; keep module algorithms behind the protocols above.
+| Method and path | Role | Behavior |
+|---|---|---|
+| `POST /api/v1/security/inspect` | `ADMIN`, `SECURITY_ANALYST` | Inspect a text payload; successful response is 201 with `{event, findings}` |
+| `GET /api/v1/security/events?offset=0&limit=50` | `ADMIN`, `SECURITY_ANALYST` | Paginated Security-only event history; `limit` is 1–100 |
+
+Inspection JSON accepts only `content` (non-blank string, max 100,000 characters) and optional `kind` (`TEXT` or `DOCUMENT_TEXT`, default `TEXT`). `DOCUMENT_TEXT` is already-extracted text, not a file parser. Request bodies are bounded at 1,000,000 bytes. Event metadata, IDs, scores, severity, priority, action, status, source, and correlation IDs are server-owned; unknown request fields are rejected.
+
+Inspection responses and history event objects contain the shared event fields. The inspection response also contains safe `findings`. Neither endpoint exposes original or redacted submitted text. History supports pagination only; the current frontend applies severity/category filters within the loaded page.
+
+Unauthenticated requests are rejected. Viewer and other module roles receive 403 for both Security endpoints. The generic shared `GET /api/v1/events` and event detail routes retain their existing authenticated-user visibility behavior.
+
+### Evidence allowlist and audit
+
+Security event `evidence` may contain only:
+
+- `rules_version`, `inspection_kind`, and `finding_count`
+- `findings`, each containing `rule_id`, `category`, `occurrences`, `score_weight`, and `context`
+- `redaction_counts`
+
+No raw request payload, submitted or redacted content, matched values, sensitive offsets, or arbitrary client metadata is included in evidence or audit details. The route uses the shared `_persist_event` path, which applies existing source authorization, commits the event, then creates the existing `event.create` audit record with actor and event ID. Those commits remain separate to preserve established transaction behavior. Invalid requests create neither event nor audit record. No direct Security-module database writes are permitted.
+
+## Shared event API and source authorization
+
+`POST /api/v1/events` remains the shared event write route. It validates `KavachEvent`, checks the authenticated role against the submitted source, persists through `_persist_event`, and audits. `ADMIN` may submit any source. `SECURITY_ANALYST` may submit `SECURITY`, `EDGE_OPERATOR` may submit `EDGE_AI`, and `NETWORK_OPERATOR` may submit `NETWORK`. A caller cannot use a different source to bypass this mapping. Existing event listing and detail semantics are unchanged.
+
+Persistence and audit are committed separately. Publishing is not wired to event persistence; a future publisher should run after commit, and durable delivery requires an outbox or equivalent. The frontend WebSocket helper has no matching backend endpoint or reconnect/delivery contract.
+
+## Ownership and current status
+
+| Owner | Module-owned scope | Current integration status |
+|---|---|---|
+| Security | Rules-based text inspection, safe event adapter, inspection/history endpoints, Security Center | Integrated through shared event persistence and audit |
+| Edge AI | Sensor validation, anomaly detection, model metadata | Module logic remains independently owned; no Security changes |
+| Network Resilience | Network health, queue/delivery observations, resilience simulation | Module logic remains independently owned; no Security changes |
+| Platform | Shared schemas, auth, database, persistence, policy interface, audit | Provides the shared contracts and mechanisms above |
+
+## Detection and test expectations
+
+Security rules cover selected prompt-injection, jailbreak, malicious-command/script, credential, and personal-data patterns. Scoring is deterministic and explainable, but weights and thresholds are not calibrated probabilities. Unicode normalization and selected obfuscation handling do not decode arbitrary base64 or parse files. Novel, multilingual, unusual, or adversarial content can evade detection; educational/cautionary context can also produce false positives or be abused. Credential and personal-data matching is partial, and redaction is not complete for all possible secrets. See `backend/app/modules/security/README.md` for the current rule and limitation details.
+
+Backend tests from `backend/`:
+
+```text
+python -m pytest
+```
+
+Pytest discovery includes `app/tests` and `app/modules/security`. Security-owned tests cover engine and safe validation, event mapping/contract, API authorization and privacy, event persistence/audit, and Alembic fresh/legacy upgrade and safe downgrade. The migration suite uses SQLite; API tests use the test client and in-memory SQLite.
+
+Frontend checks from `frontend/`:
+
+```text
+pnpm test
+pnpm run build
+```
+
+Frontend tests cover role visibility, inspection success/failure, loading/empty states, pagination and filters, nullable metrics, severity/priority display, and input privacy. Install only the dependencies declared by the respective project manifests when needed to run these commands.
